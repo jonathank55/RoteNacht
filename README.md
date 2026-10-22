@@ -4,30 +4,35 @@
 [![Language](https://img.shields.io/badge/Language-C-orange.svg)](https://en.wikipedia.org/wiki/C_(programming_language))
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**RoteNacht** ist ein eleganter, extrem leichtgewichtiger macOS-Hintergrunddienst, der den gesamten Bildschirm automatisch zu einer festlegbaren Uhrzeit (Standard: **20:00 Uhr**) in einen reinen **Schwarz/Rot-Monochrom- bzw. Binärfarbmodus** umstellt.
+**RoteNacht** ist ein eleganter, extrem leichtgewichtiger macOS-Hintergrunddienst, der den gesamten Bildschirm automatisch zu einer festlegbaren Uhrzeit (Standard: **20:00 Uhr**) in einen **100 % konsistenten Schwarz/Rot-Monochrom- bzw. Binärfarbmodus** umstellt.
 
-Wie ein klassischer Schwarz/Weiß-Modus – jedoch ohne kaltes Weiß, sondern in tiefem, augenschonenden **Rot mit vollständiger Luminanz- und Lesbarkeitserhaltung aller Farben (insbesondere Grün & Blau)**.
+Wie ein klassischer Schwarz/Weiß-Modus – jedoch ohne kaltes Weiß, sondern in tiefem, augenschonenden **Rot, bei dem Grün und alle hellen Farben als klares Hellrot abgebildet werden**.
 
 ---
 
-## 👁️ Warum Luminanz-basiertes Schwarz & Rot?
+## 👁️ Warum reines Schwarz & Rot (Grün = Hellrot)?
 
-Herkömmliche 1D-Gammamatrizen schalten den Grün- und Blaukanal einfach stumm. Das führt dazu, dass grüne Elemente (wie Ordner, Terminal-Text, Schaltflächen) fast schwarz und unlesbar werden, da Grün für das menschliche Auge 71,5 % der wahrgenommenen Helligkeit ($Y = 0.2126 R + 0.7152 G + 0.0722 B$) ausmacht.
+Herkömmliche 1D-Gammamatrizen schalten den Grünkanal einfach ab. Das führt dazu, dass grüne Elemente (wie Ordner, Terminal-Text, Buttons) fast schwarz und unlesbar werden, da Grün für das menschliche Auge 71,5 % der wahrgenommenen Helligkeit ausmacht.
 
-**RoteNacht nutzt macOS WindowServer Luminanz-Mapping + Hardware-Kanalfilter:**
-- **Volle Helligkeitserhaltung:** Grüne, weiße, gelbe und blaue Bildschirminhalte werden anhand ihrer natürlichen wahrgenommenen Luminanz in klares Rotlicht umgewandelt. Grüne Texte und Icons bleiben gestochen scharf und hell.
-- **100 % Blaulicht- und Grünlicht-Befreiung:** Am Hardware-Ausgang strahlt ausschließlich der langwelligste sichtbare Lichtkanal (Rot) ab.
-- **Erhalt der Dunkeladaption:** Rotes Licht schützt das Rhodopsin in den Stäbchen der Netzhaut und verhindert die Unterdrückung von Melatonin am Abend.
+**RoteNacht löst das Problem zweistufig und konsistent:**
+1. **Luminanz-Konvertierung:** Alle Bildschirminhalte werden anhand ihrer echten optischen Helligkeit erfasst:  
+   $$\text{Luminanz } Y = 0{,}2126 \cdot R + \mathbf{0{,}7152 \cdot G} + 0{,}0722 \cdot B$$
+2. **Reine Rot-Projektion:** Diese Helligkeit wird 1:1 auf den Rot-Kanal gelegt.  
+   - **Grün $\to$ wird zu strahlendem Hellrot.**
+   - **Weiß $\to$ wird zu Vollrot.**
+   - **Schwarz $\to$ bleibt reines Schwarz.**
+   - **Blau- und Grün-Licht am Monitor $\to$ zu 100 % physikalisch eliminiert.**
+- **Ergebnis:** Ein absolut konsistentes Schwarz/Rot-Bild ohne dunkle Löcher. Grüne Schriften und Symbole sind gestochen scharf lesbar.
 
 ---
 
 ## ✨ Features
 
 - ⏰ **Vollautomatischer Zeitplan:** Stellt um 20:00 Uhr (oder jede gewünschte Zeit via `-z`) automatisch auf Rot um und morgens (Standard: 06:00 Uhr via `-e`) zurück.
-- ⚡ **Zero Dependencies & Native C:** Nativ in C mit CoreGraphics und MediaAccessibility implementiert. Nahezu 0 % CPU-Last und minimaler Speicherverbrauch (< 5 MB).
+- ⚡ **Zero Dependencies & Native C:** Nativ in C implementiert. Nahezu 0 % CPU-Last und minimaler Speicherverbrauch (< 5 MB).
 - 🖥️ **Multi-Monitor:** Funktioniert automatisch auf allen angeschlossenen Displays (intern & extern).
 - 🔄 **Display- & Aufwach-Resistent:** Erkennt Monitor-Verbindungen (`CGDisplayRegisterReconfigurationCallback`) und Aufwachen aus dem Ruhezustand (`IORegisterForSystemPower`) und behält den Rotmodus zuverlässig bei.
-- 🎛️ **Maximale Einfachheit:** Komfortabel steuerbar mit dem deutschen Terminal-Befehl `nachtrot ein` und `nachtrot aus`.
+- 🎛️ **Maximale Einfachheit:** Komfortabel steuerbar mit `nachtrot ein` und `nachtrot aus`.
 
 ---
 
@@ -39,13 +44,9 @@ cd RoteNacht
 make install
 ```
 
-Das Skript kompiliert das native C-Binary, installiert den Befehl `nachtrot` (und `rotenacht`) in dein `~/bin/`-Verzeichnis und registriert den Hintergrunddienst als systemkonformen `LaunchAgent`.
-
 ---
 
 ## 💻 Verwendung
-
-Der zentrale Befehl lautet **`nachtrot`**:
 
 ```bash
 # Startzeit festlegen (z. B. täglich um 20:00 Uhr)
@@ -82,14 +83,6 @@ nachtrot --help
 
 ---
 
-## 🎨 Farbmodi
-
-RoteNacht unterstützt zwei Farbmodelle:
-1. **Schwarz/Rot Luminanz-Monochrom (Standard):** Alle Bildschirminhalte werden anhand ihrer natürlichen Helligkeit in reines Rot gewandelt. Grüne Texte, Syntax-Highlighting und Benutzeroberflächen bleiben mit perfekter Klarheit lesbar.
-2. **1-Bit Binär-Rot (`nachtrot -b`):** Schwellenwert-Modus (unter 50 % Helligkeit = Schwarz, ab 50 % = Vollrot). Für extremen Kontrast und Null-Ablenkung.
-
----
-
 ## 🗑️ Deinstallation
 
 ```bash
@@ -100,7 +93,6 @@ Oder direkt über das Terminal:
 ```bash
 nachtrot uninstall
 ```
-Entfernt den LaunchAgent, stoppt den Hintergrunddienst und stellt alle Display-Farbprofile auf Werkseinstellungen zurück.
 
 ---
 

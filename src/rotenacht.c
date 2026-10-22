@@ -14,6 +14,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <dlfcn.h>
 #include <pwd.h>
 
 #include <CoreGraphics/CoreGraphics.h>
@@ -21,27 +22,14 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <IOKit/IOMessage.h>
 
-#define VERSION "1.1.0"
+#define VERSION "1.3.0"
 #define DAEMON_LABEL "com.rotenacht.daemon"
-
-#define CAT_COLOR 1
-#define TYPE_TINT 16
-
-// Private MediaAccessibility Funktionen für luminanzbasiertes Color Tinting
-extern int    MADisplayFilterPrefGetCategoryEnabled(long category);
-extern void   MADisplayFilterPrefSetCategoryEnabled(long category, int on);
-extern int    MADisplayFilterPrefGetType(long category);
-extern void   MADisplayFilterPrefSetType(long category, int type);
-extern double MADisplayFilterPrefGetSingleColorHue(long category);
-extern void   MADisplayFilterPrefSetSingleColorHue(long category, double hue);
-extern double MADisplayFilterPrefGetSingleColorIntensity(long category);
-extern void   MADisplayFilterPrefSetSingleColorIntensity(long category, double v);
 
 typedef struct {
     char start_time[16];   // z. B. "20:00"
     char end_time[16];     // z. B. "06:00"
     bool enabled;          // Automatik aktiv
-    bool binary_mode;      // true = harter Schwellenwert (1-Bit), false = weicher Rot-Farbverlauf
+    bool binary_mode;      // true = 1-Bit Binärmodus, false = fließender Verlauf
     int manual_override;   // 0 = Auto, 1 = manuell EIN, -1 = manuell AUS
 } Config;
 
@@ -50,6 +38,9 @@ static volatile sig_atomic_t g_reload_config = 0;
 static bool g_current_is_red = false;
 static io_connect_t g_power_port = 0;
 static io_object_t g_power_notifier = 0;
+
+typedef void (*UAGrayscaleSetEnabled_f)(Boolean);
+typedef Boolean (*UAGrayscaleIsEnabled_f)(void);
 
 static void get_home_dir(char *buf, size_t size) {
     const char *home = getenv("HOME");
@@ -108,7 +99,6 @@ static void ensure_config_dir(void) {
     mkdir(dir, 0755);
 }
 
-// Konfiguration laden
 static void load_config(Config *cfg) {
     strncpy(cfg->start_time, "20:00", sizeof(cfg->start_time));
     strncpy(cfg->end_time, "06:00", sizeof(cfg->end_time));
@@ -145,7 +135,6 @@ static void load_config(Config *cfg) {
     fclose(f);
 }
 
-// Konfiguration speichern
 static void save_config(const Config *cfg) {
     ensure_config_dir();
     char file[1024];
@@ -167,7 +156,6 @@ static void save_config(const Config *cfg) {
     fclose(f);
 }
 
-// Zeit-String parsen ("20:00", "20.00", "20")
 static bool parse_time(const char *str, int *hours, int *minutes) {
     int h = -1, m = -1;
     if (sscanf(str, "%d:%d", &h, &m) == 2 || sscanf(str, "%d.%d", &h, &m) == 2) {
@@ -186,7 +174,6 @@ static bool parse_time(const char *str, int *hours, int *minutes) {
     return false;
 }
 
-// Prüfen, ob die aktuelle Zeit im Nachtfenster liegt
 static bool is_current_time_in_range(const char *start_str, const char *end_str) {
     int sh = 20, sm = 0, eh = 6, em = 0;
     if (!parse_time(start_str, &sh, &sm)) { sh = 20; sm = 0; }
@@ -208,21 +195,25 @@ static bool is_current_time_in_range(const char *start_str, const char *end_str)
     }
 }
 
-// Prüfen, ob der Rotmodus aktuell im Display aktiv ist
-static bool is_display_red_active(void) {
-    if (MADisplayFilterPrefGetCategoryEnabled(CAT_COLOR)) {
-        return true;
+// UniversalAccess Graustufen steuern (Wandelt Grün & alle Farben in echte Luminanz um)
+static void set_system_grayscale(bool enable) {
+    void *ua = dlopen("/System/Library/PrivateFrameworks/UniversalAccess.framework/UniversalAccess", RTLD_NOW);
+    if (ua) {
+        UAGrayscaleSetEnabled_f setGray = (UAGrayscaleSetEnabled_f)dlsym(ua, "UAGrayscaleSetEnabled");
+        if (setGray) setGray(enable);
     }
-    CGDirectDisplayID mainDisplay = CGMainDisplayID();
-    CGGammaValue r[256], g[256], b[256];
-    uint32_t count = 0;
-    if (CGGetDisplayTransferByTable(mainDisplay, 256, r, g, b, &count) == kCGErrorSuccess && count >= 128) {
-        return (g[128] < 0.05f && b[128] < 0.05f && r[128] > 0.1f);
+}
+
+static bool get_system_grayscale(void) {
+    void *ua = dlopen("/System/Library/PrivateFrameworks/UniversalAccess.framework/UniversalAccess", RTLD_NOW);
+    if (ua) {
+        UAGrayscaleIsEnabled_f isGray = (UAGrayscaleIsEnabled_f)dlsym(ua, "UAGrayscaleIsEnabled");
+        if (isGray) return isGray();
     }
     return false;
 }
 
-// Rote Gamma-Tabelle auf alle aktiven Displays anwenden (Reines Schwarz & Rot)
+// Hardware-Gamma-Ramp: Nur Rot durchlassen, Grün und Blau auf 0 klemmen
 static void apply_red_gamma(bool binary_mode) {
     uint32_t maxDisplays = 16;
     CGDirectDisplayID displays[16];
@@ -246,27 +237,26 @@ static void apply_red_gamma(bool binary_mode) {
     }
 }
 
-// RoteNacht aktivieren: Native Luminanz-Farbanpassung + Hardware-Filter
+// RoteNacht aktivieren:
+// 1. Graustufen-Luminanzmapping aktivieren: Grüne Elemente werden zu 72% heller Helligkeit
+// 2. Hardware-Gamma: Diese Helligkeit wird 1:1 als Rotlicht ausgegeben (Grün wird HELLROT, Weiß wird Vollrot, Schwarz bleibt Schwarz)
 static void enable_rotenacht(bool binary_mode) {
-    // Stufe 1: Native macOS Color Tint (rechnet Grün & Blau gemäß Augenempfindlichkeit in Rotlicht um)
-    MADisplayFilterPrefSetType(CAT_COLOR, TYPE_TINT);
-    MADisplayFilterPrefSetSingleColorHue(CAT_COLOR, 0.0);
-    MADisplayFilterPrefSetSingleColorIntensity(CAT_COLOR, 1.0);
-    MADisplayFilterPrefSetCategoryEnabled(CAT_COLOR, 1);
-
-    // Stufe 2: Hardware-Gamma-Ramp (garantiert 0% Restemission bei Grün und Blau)
+    set_system_grayscale(true);
+    usleep(250000); // 250ms für WindowServer-Compositor
     apply_red_gamma(binary_mode);
     g_current_is_red = true;
 }
 
-// RoteNacht deaktivieren & Normalfarben wiederherstellen
 static void disable_rotenacht(void) {
-    MADisplayFilterPrefSetCategoryEnabled(CAT_COLOR, 0);
+    set_system_grayscale(false);
     CGDisplayRestoreColorSyncSettings();
     g_current_is_red = false;
 }
 
-// PID-Verwaltung für den Hintergrunddienst
+static bool is_display_red_active(void) {
+    return get_system_grayscale();
+}
+
 static pid_t read_daemon_pid(void) {
     char pfile[1024];
     get_pid_file(pfile, sizeof(pfile));
@@ -305,7 +295,6 @@ static void notify_daemon_reload(void) {
     }
 }
 
-// Signale & Callbacks für Daemon
 static void handle_signal(int sig) {
     if (sig == SIGTERM || sig == SIGINT) {
         g_running = 0;
@@ -404,7 +393,12 @@ static int run_daemon(void) {
         last_check_minute = cur_minute;
 
         if (should_be_red) {
-            enable_rotenacht(cfg.binary_mode);
+            if (!g_current_is_red) {
+                enable_rotenacht(cfg.binary_mode);
+            } else {
+                // Regelmäßig Gamma-Ramp auffrischen
+                apply_red_gamma(cfg.binary_mode);
+            }
         } else {
             if (g_current_is_red) {
                 disable_rotenacht();
@@ -427,7 +421,6 @@ static int run_daemon(void) {
     return 0;
 }
 
-// Launchd Agent installieren & starten
 static bool install_launchd_service(void) {
     char plist_path[1024];
     get_plist_path(plist_path, sizeof(plist_path));
@@ -478,7 +471,6 @@ static bool install_launchd_service(void) {
     return true;
 }
 
-// Launchd Agent stoppen & entfernen
 static bool uninstall_launchd_service(void) {
     char plist_path[1024];
     get_plist_path(plist_path, sizeof(plist_path));
@@ -500,7 +492,6 @@ static bool uninstall_launchd_service(void) {
     return true;
 }
 
-// Hilfe-Anzeige
 static void print_help(void) {
     printf("\033[1;31mRoteNacht\033[0m v%s - Automatischer Schwarz/Rot-Monochrom-Nachtmodus\n\n", VERSION);
     printf("\033[1mVERWENDUNG:\033[0m\n");
@@ -522,7 +513,6 @@ static void print_help(void) {
     printf("  nachtrot aus                  (Stellt die Standardfarben sofort wieder her)\n\n");
 }
 
-// Status-Anzeige
 static void print_status(void) {
     Config cfg;
     load_config(&cfg);
@@ -541,7 +531,8 @@ static void print_status(void) {
     printf("  \033[1mAktuelle Uhrzeit:\033[0m     %02d:%02d:%02d\n", tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
     printf("  \033[1mRot-Startzeit (-z):\033[0m   \033[1;33m%s Uhr\033[0m\n", cfg.start_time);
     printf("  \033[1mRot-Endzeit (-e):\033[0m     %s Uhr\n", cfg.end_time);
-    printf("  \033[1mFarbraum-Modus:\033[0m       %s\n", cfg.binary_mode ? "1-Bit Binär (Hart)" : "Schwarz/Rot Luminanz-Monochrom (Optimiert)");
+    printf("  \033[1mFarbraum:\033[0m             \033[1;31m100%% Konsistentes Schwarz/Rot (Grün = Hellrot)\033[0m\n");
+    printf("  \033[1mBlau- & Grün-Licht:\033[0m   \033[1;32m0%% (Komplett eliminiert)\033[0m\n");
     printf("  \033[1mAutomatik-Plan:\033[0m       %s\n", cfg.enabled ? "\033[1;32mAktiviert\033[0m" : "\033[1;31mDeaktiviert\033[0m");
 
     if (cfg.manual_override == 1) {
@@ -553,7 +544,7 @@ static void print_status(void) {
     }
 
     printf("  \033[1mAktuelles Zeitfenster:\033[0m %s\n", is_in_window ? "\033[1;31mNachtmodus aktiv\033[0m" : "\033[1;32mTagmodus aktiv\033[0m");
-    printf("  \033[1mBildschirm-Filter:\033[0m    %s\n", is_red ? "\033[1;31m● ROT / MONOCHROM AKTIV\033[0m" : "\033[1;32m○ NORMALFARBEN\033[0m");
+    printf("  \033[1mBildschirm-Filter:\033[0m    %s\n", is_red ? "\033[1;31m● SCHWARZ/ROT AKTIV\033[0m" : "\033[1;32m○ NORMALFARBEN\033[0m");
     printf("  \033[1mHintergrunddienst:\033[0m    %s", daemon_pid > 0 ? "\033[1;32mLäuft\033[0m (PID " : "\033[1;31mNicht aktiv\033[0m\n");
     if (daemon_pid > 0) printf("%d)\n", daemon_pid);
 
@@ -608,7 +599,7 @@ int main(int argc, char *argv[]) {
         save_config(&cfg);
         enable_rotenacht(cfg.binary_mode);
         notify_daemon_reload();
-        printf("\033[1;31m● RoteNacht aktiviert:\033[0m Bildschirm ist jetzt dauerhaft rot/monochrom geschaltet (mit voller Grün-Klarheit).\n");
+        printf("\033[1;31m● RoteNacht aktiviert:\033[0m Komplett konsistentes Schwarz/Rot (Grün = Hellrot).\n");
         printf("  (Tipp: 'nachtrot aus' zum Ausschalten, 'nachtrot auto' für Zeitplan)\n");
         return 0;
     }
@@ -672,7 +663,7 @@ int main(int argc, char *argv[]) {
         save_config(&cfg);
         notify_daemon_reload();
         printf("Farbraum geändert zu: \033[1m%s\033[0m\n",
-               cfg.binary_mode ? "1-Bit Binär (Hart)" : "Schwarz/Rot Monochrom (Luminanz-optimiert)");
+               cfg.binary_mode ? "1-Bit Binär (Hart)" : "Schwarz/Rot Weich (Fließend)");
         if (is_display_red_active() || cfg.manual_override == 1 || (cfg.manual_override == 0 && is_current_time_in_range(cfg.start_time, cfg.end_time))) {
             enable_rotenacht(cfg.binary_mode);
         }

@@ -1,6 +1,6 @@
 CC = clang
 CFLAGS = -O2 -Wall -Wextra
-FRAMEWORKS = -framework CoreGraphics -framework CoreFoundation -framework IOKit -framework MediaAccessibility
+FRAMEWORKS = -framework CoreGraphics -framework CoreFoundation -framework IOKit
 BIN_DIR = $(HOME)/bin
 TARGET = build/rotenacht
 
