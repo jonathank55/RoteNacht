@@ -13,6 +13,9 @@ $(TARGET): src/rotenacht.c
 
 install: $(TARGET)
 	@mkdir -p $(BIN_DIR)
+	@if [ -f $(HOME)/Library/LaunchAgents/com.rotenacht.daemon.plist ]; then launchctl unload $(HOME)/Library/LaunchAgents/com.rotenacht.daemon.plist 2>/dev/null || true; fi
+	@pkill -9 nachtrot 2>/dev/null || true
+	@sleep 0.5
 	@cp $(TARGET) $(BIN_DIR)/nachtrot
 	@chmod 755 $(BIN_DIR)/nachtrot
 	@ln -sf $(BIN_DIR)/nachtrot $(BIN_DIR)/rotenacht
