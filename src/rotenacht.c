@@ -1,5 +1,5 @@
 /*
- * RoteNacht - Automatischer macOS-Nachtmodus (Schwarz/Rot & Binärfarbig)
+ * RoteNacht - Automatischer macOS-Nachtmodus (Reines Schwarz/Rot)
  * https://github.com/jonathank55/RoteNacht
  *
  * Lizenz: MIT
@@ -14,7 +14,6 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <dlfcn.h>
 #include <pwd.h>
 
 #include <CoreGraphics/CoreGraphics.h>
@@ -22,14 +21,13 @@
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <IOKit/IOMessage.h>
 
-#define VERSION "1.3.0"
+#define VERSION "2.0.0"
 #define DAEMON_LABEL "com.rotenacht.daemon"
 
 typedef struct {
     char start_time[16];   // z. B. "20:00"
     char end_time[16];     // z. B. "06:00"
     bool enabled;          // Automatik aktiv
-    bool binary_mode;      // true = 1-Bit Binärmodus, false = fließender Verlauf
     int manual_override;   // 0 = Auto, 1 = manuell EIN, -1 = manuell AUS
 } Config;
 
@@ -38,9 +36,6 @@ static volatile sig_atomic_t g_reload_config = 0;
 static bool g_current_is_red = false;
 static io_connect_t g_power_port = 0;
 static io_object_t g_power_notifier = 0;
-
-typedef void (*UAGrayscaleSetEnabled_f)(Boolean);
-typedef Boolean (*UAGrayscaleIsEnabled_f)(void);
 
 static void get_home_dir(char *buf, size_t size) {
     const char *home = getenv("HOME");
@@ -103,7 +98,6 @@ static void load_config(Config *cfg) {
     strncpy(cfg->start_time, "20:00", sizeof(cfg->start_time));
     strncpy(cfg->end_time, "06:00", sizeof(cfg->end_time));
     cfg->enabled = true;
-    cfg->binary_mode = false;
     cfg->manual_override = 0;
 
     char file[1024];
@@ -125,8 +119,6 @@ static void load_config(Config *cfg) {
                 strncpy(cfg->end_time, val, sizeof(cfg->end_time) - 1);
             } else if (strcmp(key, "enabled") == 0) {
                 cfg->enabled = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
-            } else if (strcmp(key, "binary_mode") == 0) {
-                cfg->binary_mode = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0);
             } else if (strcmp(key, "manual_override") == 0) {
                 cfg->manual_override = atoi(val);
             }
@@ -150,7 +142,6 @@ static void save_config(const Config *cfg) {
     fprintf(f, "  \"start_time\": \"%s\",\n", cfg->start_time);
     fprintf(f, "  \"end_time\": \"%s\",\n", cfg->end_time);
     fprintf(f, "  \"enabled\": %s,\n", cfg->enabled ? "true" : "false");
-    fprintf(f, "  \"binary_mode\": %s,\n", cfg->binary_mode ? "true" : "false");
     fprintf(f, "  \"manual_override\": %d\n", cfg->manual_override);
     fprintf(f, "}\n");
     fclose(f);
@@ -195,26 +186,22 @@ static bool is_current_time_in_range(const char *start_str, const char *end_str)
     }
 }
 
-// UniversalAccess Graustufen steuern (Wandelt Grün & alle Farben in echte Luminanz um)
-static void set_system_grayscale(bool enable) {
-    void *ua = dlopen("/System/Library/PrivateFrameworks/UniversalAccess.framework/UniversalAccess", RTLD_NOW);
-    if (ua) {
-        UAGrayscaleSetEnabled_f setGray = (UAGrayscaleSetEnabled_f)dlsym(ua, "UAGrayscaleSetEnabled");
-        if (setGray) setGray(enable);
-    }
-}
-
-static bool get_system_grayscale(void) {
-    void *ua = dlopen("/System/Library/PrivateFrameworks/UniversalAccess.framework/UniversalAccess", RTLD_NOW);
-    if (ua) {
-        UAGrayscaleIsEnabled_f isGray = (UAGrayscaleIsEnabled_f)dlsym(ua, "UAGrayscaleIsEnabled");
-        if (isGray) return isGray();
+// Prüfen, ob der reine Rotmodus aktiv ist (Grün & Blau auf 0)
+static bool is_display_red_active(void) {
+    CGDirectDisplayID mainDisplay = CGMainDisplayID();
+    CGGammaValue r[256], g[256], b[256];
+    uint32_t count = 0;
+    if (CGGetDisplayTransferByTable(mainDisplay, 256, r, g, b, &count) == kCGErrorSuccess && count >= 128) {
+        return (g[128] < 0.02f && b[128] < 0.02f && r[128] > 0.1f);
     }
     return false;
 }
 
-// Hardware-Gamma-Ramp: Nur Rot durchlassen, Grün und Blau auf 0 klemmen
-static void apply_red_gamma(bool binary_mode) {
+// Reiner Hardware-Rotfilter:
+// Rot = 100% physikalischer Signaldurchlass
+// Grün = 0.0 (100% geklemmt)
+// Blau = 0.0 (100% geklemmt)
+static void apply_red_gamma(void) {
     uint32_t maxDisplays = 16;
     CGDirectDisplayID displays[16];
     uint32_t displayCount = 0;
@@ -224,12 +211,8 @@ static void apply_red_gamma(bool binary_mode) {
     CGGammaValue zero[256];
 
     for (uint32_t i = 0; i < 256; i++) {
+        red[i] = (CGGammaValue)i / 255.0f;
         zero[i] = 0.0f;
-        if (binary_mode) {
-            red[i] = (i >= 128) ? 1.0f : 0.0f;
-        } else {
-            red[i] = (CGGammaValue)i / 255.0f;
-        }
     }
 
     for (uint32_t d = 0; d < displayCount; d++) {
@@ -237,24 +220,14 @@ static void apply_red_gamma(bool binary_mode) {
     }
 }
 
-// RoteNacht aktivieren:
-// 1. Graustufen-Luminanzmapping aktivieren: Grüne Elemente werden zu 72% heller Helligkeit
-// 2. Hardware-Gamma: Diese Helligkeit wird 1:1 als Rotlicht ausgegeben (Grün wird HELLROT, Weiß wird Vollrot, Schwarz bleibt Schwarz)
-static void enable_rotenacht(bool binary_mode) {
-    set_system_grayscale(true);
-    usleep(250000); // 250ms für WindowServer-Compositor
-    apply_red_gamma(binary_mode);
+static void enable_rotenacht(void) {
+    apply_red_gamma();
     g_current_is_red = true;
 }
 
 static void disable_rotenacht(void) {
-    set_system_grayscale(false);
     CGDisplayRestoreColorSyncSettings();
     g_current_is_red = false;
-}
-
-static bool is_display_red_active(void) {
-    return get_system_grayscale();
 }
 
 static pid_t read_daemon_pid(void) {
@@ -308,9 +281,7 @@ static void on_display_reconfigure(CGDirectDisplayID display, CGDisplayChangeSum
     (void)userInfo;
     if (flags & kCGDisplayBeginConfigurationFlag) return;
     if (g_current_is_red) {
-        Config cfg;
-        load_config(&cfg);
-        enable_rotenacht(cfg.binary_mode);
+        apply_red_gamma();
     }
 }
 
@@ -321,9 +292,7 @@ static void power_callback(void *refCon, io_service_t service, natural_t message
         disable_rotenacht();
     } else if (messageType == kIOMessageSystemHasPoweredOn) {
         if (g_current_is_red) {
-            Config cfg;
-            load_config(&cfg);
-            enable_rotenacht(cfg.binary_mode);
+            apply_red_gamma();
         }
     }
     if (messageType == kIOMessageCanSystemSleep || messageType == kIOMessageSystemWillSleep) {
@@ -393,12 +362,7 @@ static int run_daemon(void) {
         last_check_minute = cur_minute;
 
         if (should_be_red) {
-            if (!g_current_is_red) {
-                enable_rotenacht(cfg.binary_mode);
-            } else {
-                // Regelmäßig Gamma-Ramp auffrischen
-                apply_red_gamma(cfg.binary_mode);
-            }
+            enable_rotenacht();
         } else {
             if (g_current_is_red) {
                 disable_rotenacht();
@@ -493,7 +457,7 @@ static bool uninstall_launchd_service(void) {
 }
 
 static void print_help(void) {
-    printf("\033[1;31mRoteNacht\033[0m v%s - Automatischer Schwarz/Rot-Monochrom-Nachtmodus\n\n", VERSION);
+    printf("\033[1;31mRoteNacht\033[0m v%s - Automatischer Schwarz/Rot-Nachtmodus (Reines Hardware-Rot)\n\n", VERSION);
     printf("\033[1mVERWENDUNG:\033[0m\n");
     printf("  nachtrot                      Status anzeigen & Kurzanleitung\n");
     printf("  nachtrot \033[1;33m-z <Uhrzeit>\033[0m         Startzeit für Rotmodus setzen (z. B. 20:00)\n");
@@ -502,14 +466,13 @@ static void print_help(void) {
     printf("  nachtrot \033[1;31maus\033[0m                  Rotmodus sofort manuell ausschalten\n");
     printf("  nachtrot toggle               Zwischen Rotmodus und Normalfarben umschalten\n");
     printf("  nachtrot auto                 Manuellen Override beenden, Zeitplan folgen\n");
-    printf("  nachtrot -b | --binary        Binärmodus umschalten (weicher Farbverlauf vs. 1-Bit)\n");
     printf("  nachtrot status               Detaillierten System- & Dienststatus prüfen\n");
     printf("  nachtrot install              Hintergrunddienst (LaunchAgent) installieren & starten\n");
     printf("  nachtrot uninstall            Hintergrunddienst vollständig deinstallieren\n");
     printf("  nachtrot -h | --help          Diese Hilfe anzeigen\n\n");
     printf("\033[1mBEISPIELE:\033[0m\n");
     printf("  nachtrot -z 20:00             (Aktiviert Rotmodus täglich ab 20:00 Uhr)\n");
-    printf("  nachtrot ein                  (Schaltet den Bildschirm sofort auf Schwarz/Rot)\n");
+    printf("  nachtrot ein                  (Schaltet den Bildschirm sofort auf Rot)\n");
     printf("  nachtrot aus                  (Stellt die Standardfarben sofort wieder her)\n\n");
 }
 
@@ -531,8 +494,7 @@ static void print_status(void) {
     printf("  \033[1mAktuelle Uhrzeit:\033[0m     %02d:%02d:%02d\n", tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
     printf("  \033[1mRot-Startzeit (-z):\033[0m   \033[1;33m%s Uhr\033[0m\n", cfg.start_time);
     printf("  \033[1mRot-Endzeit (-e):\033[0m     %s Uhr\n", cfg.end_time);
-    printf("  \033[1mFarbraum:\033[0m             \033[1;31m100%% Konsistentes Schwarz/Rot (Grün = Hellrot)\033[0m\n");
-    printf("  \033[1mBlau- & Grün-Licht:\033[0m   \033[1;32m0%% (Komplett eliminiert)\033[0m\n");
+    printf("  \033[1mModus:\033[0m                \033[1;31mReines Hardware-Rot (100%% Rot, 0%% Grün, 0%% Blau)\033[0m\n");
     printf("  \033[1mAutomatik-Plan:\033[0m       %s\n", cfg.enabled ? "\033[1;32mAktiviert\033[0m" : "\033[1;31mDeaktiviert\033[0m");
 
     if (cfg.manual_override == 1) {
@@ -544,7 +506,7 @@ static void print_status(void) {
     }
 
     printf("  \033[1mAktuelles Zeitfenster:\033[0m %s\n", is_in_window ? "\033[1;31mNachtmodus aktiv\033[0m" : "\033[1;32mTagmodus aktiv\033[0m");
-    printf("  \033[1mBildschirm-Filter:\033[0m    %s\n", is_red ? "\033[1;31m● SCHWARZ/ROT AKTIV\033[0m" : "\033[1;32m○ NORMALFARBEN\033[0m");
+    printf("  \033[1mBildschirm-Filter:\033[0m    %s\n", is_red ? "\033[1;31m● ROTMODUS AKTIV\033[0m" : "\033[1;32m○ NORMALFARBEN\033[0m");
     printf("  \033[1mHintergrunddienst:\033[0m    %s", daemon_pid > 0 ? "\033[1;32mLäuft\033[0m (PID " : "\033[1;31mNicht aktiv\033[0m\n");
     if (daemon_pid > 0) printf("%d)\n", daemon_pid);
 
@@ -597,9 +559,9 @@ int main(int argc, char *argv[]) {
         load_config(&cfg);
         cfg.manual_override = 1;
         save_config(&cfg);
-        enable_rotenacht(cfg.binary_mode);
+        enable_rotenacht();
         notify_daemon_reload();
-        printf("\033[1;31m● RoteNacht aktiviert:\033[0m Komplett konsistentes Schwarz/Rot (Grün = Hellrot).\n");
+        printf("\033[1;31m● RoteNacht aktiviert:\033[0m Bildschirm auf reines Rot umgeschaltet.\n");
         printf("  (Tipp: 'nachtrot aus' zum Ausschalten, 'nachtrot auto' für Zeitplan)\n");
         return 0;
     }
@@ -630,7 +592,7 @@ int main(int argc, char *argv[]) {
         } else {
             cfg.manual_override = 1;
             save_config(&cfg);
-            enable_rotenacht(cfg.binary_mode);
+            enable_rotenacht();
             printf("\033[1;31m● RoteNacht aktiviert.\033[0m\n");
         }
         notify_daemon_reload();
@@ -646,26 +608,11 @@ int main(int argc, char *argv[]) {
         notify_daemon_reload();
         bool in_window = is_current_time_in_range(cfg.start_time, cfg.end_time);
         if (in_window) {
-            enable_rotenacht(cfg.binary_mode);
+            enable_rotenacht();
             printf("\033[1;32m✓ Automatik wiederhergestellt.\033[0m Aktuell im Nachtfenster -> \033[1;31mRotmodus dauerhaft aktiv\033[0m.\n");
         } else {
             disable_rotenacht();
             printf("\033[1;32m✓ Automatik wiederhergestellt.\033[0m Aktuell im Tagfenster -> \033[1;32mNormalfarben aktiv\033[0m.\n");
-        }
-        return 0;
-    }
-
-    // Binärmodus umschalten
-    if (strcmp(argv[1], "-b") == 0 || strcmp(argv[1], "--binary") == 0) {
-        Config cfg;
-        load_config(&cfg);
-        cfg.binary_mode = !cfg.binary_mode;
-        save_config(&cfg);
-        notify_daemon_reload();
-        printf("Farbraum geändert zu: \033[1m%s\033[0m\n",
-               cfg.binary_mode ? "1-Bit Binär (Hart)" : "Schwarz/Rot Weich (Fließend)");
-        if (is_display_red_active() || cfg.manual_override == 1 || (cfg.manual_override == 0 && is_current_time_in_range(cfg.start_time, cfg.end_time))) {
-            enable_rotenacht(cfg.binary_mode);
         }
         return 0;
     }
@@ -715,7 +662,7 @@ int main(int argc, char *argv[]) {
                cfg.start_time, cfg.end_time);
 
         if (cfg.manual_override == 0 && is_current_time_in_range(cfg.start_time, cfg.end_time)) {
-            enable_rotenacht(cfg.binary_mode);
+            enable_rotenacht();
             printf("\033[1;31m● Aktuell im Nachtfenster -> Rotmodus sofort eingeschaltet.\033[0m\n");
         } else if (cfg.manual_override == 0) {
             disable_rotenacht();
