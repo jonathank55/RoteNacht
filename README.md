@@ -6,34 +6,32 @@
 
 **RoteNacht** ist ein eleganter, extrem leichtgewichtiger macOS-Hintergrunddienst, der den gesamten Bildschirm automatisch zu einer festlegbaren Uhrzeit (Standard: **20:00 Uhr**) in einen reinen **Schwarz/Rot-Monochrom- bzw. Binärfarbmodus** umstellt.
 
-Wie ein klassischer Schwarz/Weiß-Modus – jedoch ohne kaltes Weiß, sondern in tiefem, augenschonenden **Rot**.
+Wie ein klassischer Schwarz/Weiß-Modus – jedoch ohne kaltes Weiß, sondern in tiefem, augenschonenden **Rot mit vollständiger Luminanz- und Lesbarkeitserhaltung aller Farben (insbesondere Grün & Blau)**.
 
 ---
 
-## 👁️ Warum Schwarz & Rot?
+## 👁️ Warum Luminanz-basiertes Schwarz & Rot?
 
-Herkömmliche Nachtfilter ("Night Shift", "True Tone") reduzieren blaues Licht nur minimal. Kurzwellige Grün- und Restblaustrahlen unterdrücken weiterhin die körpereigene Melatoninproduktion. 
+Herkömmliche 1D-Gammamatrizen schalten den Grün- und Blaukanal einfach stumm. Das führt dazu, dass grüne Elemente (wie Ordner, Terminal-Text, Schaltflächen) fast schwarz und unlesbar werden, da Grün für das menschliche Auge 71,5 % der wahrgenommenen Helligkeit ($Y = 0.2126 R + 0.7152 G + 0.0722 B$) ausmacht.
 
-**RoteNacht eliminiert alle Grün- und Blaukanäle vollständig:**
-- **100 % Blaulicht- und Grünlicht-Befreiung:** Es strahlt ausschließlich die langwelligste sichtbare Lichtkomponente (Rot) ab.
-- **Erhalt der Dunkeladaption:** Rotes Licht zersetzt das Sehpurpur (Rhodopsin) der Stäbchen in der Netzhaut nicht.
-- **Monochrom / Binär:** Der gesamte Bildschirminhalt (Texte, Webseiten, Bilder, Menüs) wird deterministisch in Rot-Intensitäten auf reinem Schwarz abgebildet.
+**RoteNacht nutzt macOS WindowServer Luminanz-Mapping + Hardware-Kanalfilter:**
+- **Volle Helligkeitserhaltung:** Grüne, weiße, gelbe und blaue Bildschirminhalte werden anhand ihrer natürlichen wahrgenommenen Luminanz in klares Rotlicht umgewandelt. Grüne Texte und Icons bleiben gestochen scharf und hell.
+- **100 % Blaulicht- und Grünlicht-Befreiung:** Am Hardware-Ausgang strahlt ausschließlich der langwelligste sichtbare Lichtkanal (Rot) ab.
+- **Erhalt der Dunkeladaption:** Rotes Licht schützt das Rhodopsin in den Stäbchen der Netzhaut und verhindert die Unterdrückung von Melatonin am Abend.
 
 ---
 
 ## ✨ Features
 
 - ⏰ **Vollautomatischer Zeitplan:** Stellt um 20:00 Uhr (oder jede gewünschte Zeit via `-z`) automatisch auf Rot um und morgens (Standard: 06:00 Uhr via `-e`) zurück.
-- ⚡ **Zero Dependencies & Native C:** Nutzt direkte macOS CoreGraphics- und Accessibility-APIs. Nahezu 0 % CPU-Last und minimaler Speicherverbrauch (< 5 MB).
+- ⚡ **Zero Dependencies & Native C:** Nativ in C mit CoreGraphics und MediaAccessibility implementiert. Nahezu 0 % CPU-Last und minimaler Speicherverbrauch (< 5 MB).
 - 🖥️ **Multi-Monitor:** Funktioniert automatisch auf allen angeschlossenen Displays (intern & extern).
 - 🔄 **Display- & Aufwach-Resistent:** Erkennt Monitor-Verbindungen (`CGDisplayRegisterReconfigurationCallback`) und Aufwachen aus dem Ruhezustand (`IORegisterForSystemPower`) und behält den Rotmodus zuverlässig bei.
-- 🎛️ **Maximale Einfachheit:** Steuerbar mit dem kurzen Terminal-Befehl `nachtrot`.
+- 🎛️ **Maximale Einfachheit:** Komfortabel steuerbar mit dem deutschen Terminal-Befehl `nachtrot ein` und `nachtrot aus`.
 
 ---
 
 ## 🚀 Installation
-
-### Schnell-Installation via Git:
 
 ```bash
 git clone https://github.com/jonathank55/RoteNacht.git
@@ -56,22 +54,22 @@ nachtrot -z 20:00
 # Endzeit festlegen (z. B. morgens um 07:00 Uhr)
 nachtrot -e 07:00
 
+# Rotmodus sofort manuell ein- oder ausschalten
+nachtrot ein
+nachtrot aus
+
 # Status & Konfiguration prüfen
 nachtrot status
 # oder einfach:
 nachtrot
 
-# Rotmodus sofort manuell ein- oder ausschalten
-nachtrot on
-nachtrot off
-
 # Modus umschalten (Toggle)
 nachtrot toggle
 
-# Manuellen Override beenden und dem Zeitplan folgen
+# Manuellen Override beenden und dem automatischen Zeitplan folgen
 nachtrot auto
 
-# Zwischen fließendem Schwarz/Rot-Verlauf und hartem 1-Bit Binär-Rot umschalten
+# Zwischen weichem Schwarz/Rot-Verlauf und hartem 1-Bit Binär-Rot umschalten
 nachtrot -b
 
 # Hintergrunddienst starten oder stoppen
@@ -87,17 +85,8 @@ nachtrot --help
 ## 🎨 Farbmodi
 
 RoteNacht unterstützt zwei Farbmodelle:
-1. **Schwarz/Rot Monochrom (Standard):** Alle Bildschirminhalte werden in Graustufen umgewandelt und als kontinuierlicher Helligkeitsverlauf von reinem Schwarz bis Vollrot dargestellt. Ideal zum Lesen, Coden und Arbeiten.
+1. **Schwarz/Rot Luminanz-Monochrom (Standard):** Alle Bildschirminhalte werden anhand ihrer natürlichen Helligkeit in reines Rot gewandelt. Grüne Texte, Syntax-Highlighting und Benutzeroberflächen bleiben mit perfekter Klarheit lesbar.
 2. **1-Bit Binär-Rot (`nachtrot -b`):** Schwellenwert-Modus (unter 50 % Helligkeit = Schwarz, ab 50 % = Vollrot). Für extremen Kontrast und Null-Ablenkung.
-
----
-
-## ⚙️ Technische Funktionsweise
-
-RoteNacht arbeitet in zwei synchronisierten Stufen auf Systemebene:
-1. **Luminanz-Mapping:** Über das interne `UniversalAccess`-Framework (`UAGrayscaleSetEnabled`) wird das Bildschirmsignal des WindowServers in einfarbige Luminanz überführt.
-2. **Kanal-Isolation:** Mittels CoreGraphics `CGSetDisplayTransferByTable` wird eine Hardware-Gammamatrix auf alle Grafikausgänge gelegt, die den Grün- und Blau-Transfervektor auf exakt `0.0` klemmt und den Rot-Transfervektor an die berechnete Luminanz koppelt.
-3. **Launchd Daemon:** Der Hintergrunddienst läuft als `com.rotenacht.daemon` im Benutzerkontext ohne Root-Rechte.
 
 ---
 
