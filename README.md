@@ -32,8 +32,8 @@ Herkömmliche Nachtfilter („Night Shift“, „True Tone“) reduzieren blaues
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/jonathank55/RoteNacht.git
-cd RoteNacht
+git clone https://github.com/jonathank55/RoteNacht.git ~/.config/rotenacht
+cd ~/.config/rotenacht
 make install
 ```
 
@@ -76,7 +76,7 @@ nachtrot --help
 ## 🗑️ Deinstallation
 
 ```bash
-cd RoteNacht
+cd ~/.config/rotenacht
 make uninstall
 ```
 Oder direkt über das Terminal:
