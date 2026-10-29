@@ -111,7 +111,9 @@ static void load_config(Config *cfg) {
         if (sscanf(line, " \"%[^\"]\" : \"%[^\"]\"", key, val) == 2 ||
             sscanf(line, " \"%[^\"]\" : %[^, \n\r]", key, val) == 2 ||
             sscanf(line, "\"%[^\"]\": \"%[^\"]\"", key, val) == 2 ||
-            sscanf(line, "\"%[^\"]\": %[^, \n\r]", key, val) == 2) {
+            sscanf(line, "\"%[^\"]\": %[^, \n\r]", key, val) == 2 ||
+            sscanf(line, " \"%[^\"]\": \"%[^\"]\"", key, val) == 2 ||
+            sscanf(line, " \"%[^\"]\": %[^, \n\r]", key, val) == 2) {
             
             if (strcmp(key, "start_time") == 0) {
                 strncpy(cfg->start_time, val, sizeof(cfg->start_time) - 1);
@@ -223,11 +225,13 @@ static void apply_red_gamma(void) {
 static void enable_rotenacht(void) {
     apply_red_gamma();
     g_current_is_red = true;
+    usleep(20000);
 }
 
 static void disable_rotenacht(void) {
     CGDisplayRestoreColorSyncSettings();
     g_current_is_red = false;
+    usleep(20000);
 }
 
 static pid_t read_daemon_pid(void) {
@@ -302,7 +306,29 @@ static void power_callback(void *refCon, io_service_t service, natural_t message
 
 // Daemon-Schleife
 static int run_daemon(void) {
-    write_daemon_pid(getpid());
+    Config cfg;
+    load_config(&cfg);
+
+    if (cfg.manual_override == -1) {
+        disable_rotenacht();
+        remove_daemon_pid();
+        return 0;
+    }
+
+    bool initial_red = false;
+    if (cfg.manual_override == 1) {
+        initial_red = true;
+    } else if (cfg.manual_override == -1) {
+        initial_red = false;
+    } else if (cfg.enabled) {
+        initial_red = is_current_time_in_range(cfg.start_time, cfg.end_time);
+    }
+
+    if (initial_red) {
+        enable_rotenacht();
+    } else {
+        disable_rotenacht();
+    }
 
     signal(SIGTERM, handle_signal);
     signal(SIGINT, handle_signal);
@@ -318,8 +344,7 @@ static int run_daemon(void) {
                            kCFRunLoopDefaultMode);
     }
 
-    Config cfg;
-    load_config(&cfg);
+    write_daemon_pid(getpid());
 
     int last_check_minute = -1;
 
@@ -327,6 +352,23 @@ static int run_daemon(void) {
         if (g_reload_config) {
             g_reload_config = 0;
             load_config(&cfg);
+            if (cfg.manual_override == -1) {
+                g_running = 0;
+                break;
+            }
+            bool new_red = false;
+            if (cfg.manual_override == 1) {
+                new_red = true;
+            } else if (cfg.manual_override == -1) {
+                new_red = false;
+            } else if (cfg.enabled) {
+                new_red = is_current_time_in_range(cfg.start_time, cfg.end_time);
+            }
+            if (new_red) {
+                enable_rotenacht();
+            } else {
+                disable_rotenacht();
+            }
         }
 
         time_t now = time(NULL);
@@ -429,8 +471,12 @@ static bool install_launchd_service(void) {
     fclose(f);
 
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "launchctl unload \"%s\" 2>/dev/null; launchctl load \"%s\"", plist_path, plist_path);
+    snprintf(cmd, sizeof(cmd), "launchctl unload \"%s\" 2>/dev/null; launchctl load -w \"%s\"", plist_path, plist_path);
     system(cmd);
+
+    for (int i = 0; i < 10 && read_daemon_pid() <= 0; i++) {
+        usleep(50000);
+    }
 
     return true;
 }
@@ -440,7 +486,7 @@ static bool uninstall_launchd_service(void) {
     get_plist_path(plist_path, sizeof(plist_path));
 
     char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "launchctl unload \"%s\" 2>/dev/null", plist_path);
+    snprintf(cmd, sizeof(cmd), "launchctl unload -w \"%s\" 2>/dev/null", plist_path);
     system(cmd);
 
     unlink(plist_path);
@@ -448,12 +494,65 @@ static bool uninstall_launchd_service(void) {
     pid_t pid = read_daemon_pid();
     if (pid > 0) {
         kill(pid, SIGTERM);
-        sleep(1);
+        for (int i = 0; i < 10 && read_daemon_pid() > 0; i++) {
+            usleep(50000);
+        }
+        if (read_daemon_pid() > 0) {
+            kill(pid, SIGKILL);
+        }
     }
     remove_daemon_pid();
     disable_rotenacht();
 
     return true;
+}
+
+static void stop_daemon(void) {
+    char plist_path[1024];
+    get_plist_path(plist_path, sizeof(plist_path));
+
+    if (access(plist_path, F_OK) == 0) {
+        char cmd[1024];
+        snprintf(cmd, sizeof(cmd), "launchctl unload -w \"%s\" 2>/dev/null", plist_path);
+        system(cmd);
+    }
+
+    pid_t pid = read_daemon_pid();
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+        for (int i = 0; i < 10 && read_daemon_pid() > 0; i++) {
+            usleep(50000);
+        }
+        if (read_daemon_pid() > 0) {
+            kill(pid, SIGKILL);
+        }
+    }
+    remove_daemon_pid();
+}
+
+static void start_daemon(void) {
+    char plist_path[1024];
+    get_plist_path(plist_path, sizeof(plist_path));
+
+    if (access(plist_path, F_OK) != 0) {
+        install_launchd_service();
+        return;
+    }
+
+    pid_t pid = read_daemon_pid();
+    if (pid > 0) {
+        notify_daemon_reload();
+        return;
+    }
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "launchctl load -w \"%s\" 2>/dev/null || (launchctl unload \"%s\" 2>/dev/null; launchctl load -w \"%s\" 2>/dev/null)", plist_path, plist_path, plist_path);
+    system(cmd);
+
+    for (int i = 0; i < 15 && read_daemon_pid() <= 0; i++) {
+        usleep(50000);
+    }
+    usleep(50000);
 }
 
 static void print_help(void) {
@@ -507,11 +606,11 @@ static void print_status(void) {
 
     printf("  \033[1mAktuelles Zeitfenster:\033[0m %s\n", is_in_window ? "\033[1;31mNachtmodus aktiv\033[0m" : "\033[1;32mTagmodus aktiv\033[0m");
     printf("  \033[1mBildschirm-Filter:\033[0m    %s\n", is_red ? "\033[1;31m● ROTMODUS AKTIV\033[0m" : "\033[1;32m○ NORMALFARBEN\033[0m");
-    printf("  \033[1mHintergrunddienst:\033[0m    %s", daemon_pid > 0 ? "\033[1;32mLäuft\033[0m (PID " : "\033[1;31mNicht aktiv\033[0m\n");
+    printf("  \033[1mHintergrunddienst:\033[0m    %s", daemon_pid > 0 ? "\033[1;32mLäuft\033[0m (PID " : "\033[1;31mHeruntergefahren / Inaktiv\033[0m\n");
     if (daemon_pid > 0) printf("%d)\n", daemon_pid);
 
     printf("\n\033[1;31m──────────────────────────────────────────────────\033[0m\n");
-    printf("  Befehle: 'nachtrot -z 20:00' | 'nachtrot ein' | 'nachtrot aus'\n");
+    printf("  Befehle: 'nachtrot -z 20:00' | 'nachtrot ein' | 'nachtrot aus' | 'nachtrot auto'\n");
     printf("\033[1;31m──────────────────────────────────────────────────\033[0m\n\n");
 }
 
@@ -559,9 +658,8 @@ int main(int argc, char *argv[]) {
         load_config(&cfg);
         cfg.manual_override = 1;
         save_config(&cfg);
-        enable_rotenacht();
-        notify_daemon_reload();
-        printf("\033[1;31m● RoteNacht aktiviert:\033[0m Bildschirm auf reines Rot umgeschaltet.\n");
+        start_daemon();
+        printf("\033[1;31m● RoteNacht aktiviert:\033[0m Bildschirm auf reines Rot umgeschaltet (Hintergrunddienst aktiv).\n");
         printf("  (Tipp: 'nachtrot aus' zum Ausschalten, 'nachtrot auto' für Zeitplan)\n");
         return 0;
     }
@@ -573,9 +671,9 @@ int main(int argc, char *argv[]) {
         load_config(&cfg);
         cfg.manual_override = -1;
         save_config(&cfg);
+        stop_daemon();
         disable_rotenacht();
-        notify_daemon_reload();
-        printf("\033[1;32m○ RoteNacht deaktiviert:\033[0m Bildschirmfarben normalisiert.\n");
+        printf("\033[1;32m○ RoteNacht deaktiviert:\033[0m Bildschirmfarben normalisiert und Hintergrunddienst heruntergefahren.\n");
         printf("  (Tipp: 'nachtrot ein' zum Einschalten, 'nachtrot auto' für Zeitplan)\n");
         return 0;
     }
@@ -587,15 +685,15 @@ int main(int argc, char *argv[]) {
         if (is_display_red_active()) {
             cfg.manual_override = -1;
             save_config(&cfg);
+            stop_daemon();
             disable_rotenacht();
-            printf("\033[1;32m○ RoteNacht deaktiviert.\033[0m\n");
+            printf("\033[1;32m○ RoteNacht deaktiviert:\033[0m Bildschirmfarben normalisiert und Hintergrunddienst heruntergefahren.\n");
         } else {
             cfg.manual_override = 1;
             save_config(&cfg);
-            enable_rotenacht();
-            printf("\033[1;31m● RoteNacht aktiviert.\033[0m\n");
+            start_daemon();
+            printf("\033[1;31m● RoteNacht aktiviert:\033[0m Bildschirm auf reines Rot umgeschaltet (Hintergrunddienst aktiv).\n");
         }
-        notify_daemon_reload();
         return 0;
     }
 
@@ -605,14 +703,12 @@ int main(int argc, char *argv[]) {
         load_config(&cfg);
         cfg.manual_override = 0;
         save_config(&cfg);
-        notify_daemon_reload();
+        start_daemon();
         bool in_window = is_current_time_in_range(cfg.start_time, cfg.end_time);
         if (in_window) {
-            enable_rotenacht();
-            printf("\033[1;32m✓ Automatik wiederhergestellt.\033[0m Aktuell im Nachtfenster -> \033[1;31mRotmodus dauerhaft aktiv\033[0m.\n");
+            printf("\033[1;32m✓ Automatik wiederhergestellt.\033[0m Hintergrunddienst aktiv. Aktuell im Nachtfenster -> \033[1;31mRotmodus dauerhaft aktiv\033[0m.\n");
         } else {
-            disable_rotenacht();
-            printf("\033[1;32m✓ Automatik wiederhergestellt.\033[0m Aktuell im Tagfenster -> \033[1;32mNormalfarben aktiv\033[0m.\n");
+            printf("\033[1;32m✓ Automatik wiederhergestellt.\033[0m Hintergrunddienst aktiv. Aktuell im Tagfenster -> \033[1;32mNormalfarben aktiv\033[0m.\n");
         }
         return 0;
     }
@@ -651,11 +747,8 @@ int main(int argc, char *argv[]) {
     if (changed) {
         save_config(&cfg);
 
-        pid_t pid = read_daemon_pid();
-        if (pid <= 0) {
-            install_launchd_service();
-        } else {
-            notify_daemon_reload();
+        if (cfg.manual_override != -1) {
+            start_daemon();
         }
 
         printf("\033[1;32m✓ Zeitplan aktualisiert:\033[0m Täglich ab \033[1;33m%s Uhr\033[0m bis \033[1;33m%s Uhr\033[0m.\n",
